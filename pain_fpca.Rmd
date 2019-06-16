@@ -1,0 +1,277 @@
+---
+title: "Functional Principal Component Analysis for OA Knee Pain Progression"
+author: "Jenny Lee"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+geometry: "left=3cm,right=3cm,top=2cm,bottom=2cm"
+output:
+  pdf_document: 
+      latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, 
+                      message = FALSE, fig.dim = c(11, 7))
+library(tidyverse)
+library(splines)
+library(sm)
+library(fpca)
+
+setwd("~/Workspace/fPCA_KOOS/fPCA_KOOS")
+rm(list=ls())
+set.seed(247)
+
+```
+
+# 1. Introduction
+
+The goal of this study is to perform unsupervised analysis of temporal pain progression in knee osteoarthritis incidence cohort to identify latent pattern of pain trajectory and to reduce the dimension of the dataset for later analysis. 
+
+# 2. Dataset preparation
+
+## 2.1 Dataset description
+The KOOS dataset is from Osteoarthritis Initiative (OAI), completed multicenter clinical study. Each subject reported the knee pain (0: extreme problems, 100: no problems) on each knee annualy upto nine times during the period of the study. We treated each knee of the same subject as different subjects. The measurements were sparse and irregularly observed. A total of 3,327 subjects (34.69%) have missing values at some visit time point, while 1,043 (31.35%) are missing 1 to 2 visits. 
+
+## 2.2 Inclusion criteria
+ If subjects undergone total knee replacement surgery, only the pain scores until the last visit before the total knee replacement surgery were considered. We focused on subjects who have measurements more than two time points (n = -, - measurement). 
+ * include incidence cohort, defined by OAI, only or to use KLG to determine oa status and use them to filter the progression groups
+ * Whether to constrict the pain score at baseline, if so lower than 100 by how much?
+ Stanford paper treated measurements outside 3 * SD as NAs. 
+ * how to control pain medicine usage 
+ * how many missing values are allowed per subject?
+ 
+ 
+```{r data}
+
+# read in clean koos progression data ----------------------------------------
+# For details in preparation of datasets, pain_wide and timetable,  
+# look /data/knee_mri3/JL/predict_future_pain/match_koos_with_date.ipynb
+pain_wide <- read.csv('Data/all_koos_wide.csv', stringsAsFactors = FALSE)
+rownames(pain_wide) <- paste(pain_wide$combined_id, '_0', sep = '')
+
+# count the number of measurement per subject
+tmp <- apply(pain_wide[2:13], 1, function(x){sum(!is.na(x))})
+table(tmp)
+rm(tmp, no_pain, demo_info)
+
+# read in normalized exact time of measurements
+timetable <- read.csv('Data/timepoint_table2.csv', stringsAsFactors = FALSE)
+rownames(timetable) <- paste(timetable$combined_id, '_0', sep = '')
+
+# converting days to weeksres$
+timetable[, 2:13] <- ceiling(timetable[, 2:13] / 7)
+
+# read in demo info data
+demo_info <- read.csv('Data/combined_pain_all_visit.csv',
+                      stringsAsFactors = FALSE)
+
+# choose subjects who showed no symptomatic oa at baseline
+no_pain <- demo_info %>%
+  filter(visit == 0) %>%
+  filter(womac == 0 | koos == 100) 
+
+pain_wide <- pain_wide[no_pain$id_side_visit, ]
+# count the OAI participant who has the perfect pain score at enrollement
+
+tmp <- lapply(pain_wide$combined_id, function(x){
+  unlist(strsplit(x, '_'))[[1]][1]
+})
+length(unique(tmp))
+
+
+# filter samples that have at least two measurements
+pain_wide <- pain_wide[rowSums(!is.na(pain_wide[2:13])) >= 2, ]
+pain_wide <- pain_wide[!is.na(pain_wide$combined_id), ]
+pain_wide <- pain_wide %>% arrange(combined_id)
+# reassign rownames that were lost in arrange operation
+rownames(pain_wide) <- paste(pain_wide$combined_id, '_0', sep = '')
+
+timetable <- timetable[rownames(pain_wide), ]
+
+```
+
+
+Plot of raw (no smoothing is performed) KOOS progression againt the visit time points below. Red line is point-wise mean at given time point.
+
+
+```{r }
+
+pain_long <- gather(pain_wide, key = 'timepoint', na.rm = FALSE,
+                    value = 'koos', V00:V11, factor_key = FALSE)
+time_long <- gather(timetable, key = 'timepoint', na.rm = FALSE, 
+                    value = 'time', V00:V11, factor_key = FALSE)
+pain_long <- left_join(pain_long, time_long, 
+                       by = c('combined_id', 'timepoint'))
+pain_long <- pain_long %>% drop_na() 
+
+grp_mean <- pain_long %>% 
+  mutate(time_r = round(time + 5, -1)) %>%
+  group_by(time_r) %>%
+  summarise(m = mean(koos), na.rm = TRUE)
+
+# write.csv(grp_mean, file = 'Results/pointwise_mean.csv')
+
+
+ggplot(data = pain_long) +
+  geom_point(aes(x = time, y = koos), alpha = .1) +
+  geom_line(aes(x = time, y = koos, group = combined_id), alpha = .05) +
+  geom_line(data = grp_mean, aes(x = time_r, y = m), colour = 'red') +
+  ylim(0, 105) +
+  ggsave(filename = 'Figs/not_smoothed_pain_trajectory.png',
+         height = 7, width = 11, units = 'in', dpi = 500)
+
+```
+
+# 3. Methods 
+As the given datasets are sparsely observed and many of samples have missing data points, we applied functional principal component analysis for sparse data in order to discover smooth latent pain trajectories for each subject.  
+
+```{r}
+# select columns - ID, centered KOOS scores, rounded time to the nearest 100
+pain <- pain_long %>%
+  mutate(time_n = time / max(time)) %>%
+  mutate(time_n = round(time_n, 4)) %>%
+  arrange(combined_id, time) %>%   # fpca.score expects this 
+  select(combined_id, koos, time_n)
+
+# candidate models for fitting 
+# M: number of basis (>= 4)
+# r: dimension of the process (num of non-zero eigen values) (>= 1)
+
+# res <- fpca.mle(data.m = as.matrix(pain),
+#                 M.set = c(6, 7, 8, 9, 10),
+#                 r.set = c(2, 3, 4, 5),
+#                 ini.method = 'loc',
+#                 max.step = 50)
+# 
+# 
+# save(res, file = 'Results/res.rda')
+
+```
+
+```{r}
+load('Results/res.rda')
+
+M <- res$selected_model[1]
+r <- res$selected_model[2]
+
+# res_fitted <- fpca.mle(data.m = as.matrix(pain),
+#                 M.set = M,
+#                 r.set = r,
+#                 ini.method = 'loc',
+#                 max.step = 50)
+# save(res, file = 'Results/res_fitted.rda')
+
+f_scores <- fpca.score(as.matrix(pain), 
+                       res$grid,
+                       res$fitted_mean,
+                       res$eigenvalues,
+                       res$eigenfunctions,
+                       res$error_var,
+                       4)
+
+preds <- fpca.pred(f_scores, 
+                   muhat = res$fitted_mean,
+                   eigenfuncs = res$eigenfunctions)
+
+preds <- data.frame(t(preds), row.names = rownames(pain_wide))
+
+save(pain_wide, pain_long, pain, timetable, 
+     res, f_scores, preds,
+     file = 'Results/fpca_results.rda')
+
+write.csv(f_scores, 'Results/f_scores.csv')
+write.csv(preds, 'Results/predicted_pain_series.csv')
+write.csv(pain_wide, 'Results/observed_pain_series.csv')
+```
+
+
+
+```{r}
+
+# function for plot comparing predicted and observed
+load('Results/fpca_results.rda')
+vis_compare <- function(i, ylim = c(-5, 105)){
+  # also depends on res, pain_long, preds, pain_wide, timetable
+  tmp <- data.frame(
+    # converting back to weeks 
+    time = res$grid * max(pain_long$time),
+    p = as.vector(t(preds[i, ])))
+  
+  tmp2 <- data.frame(
+    time = as.vector(t(timetable[i, 2:13])),
+    obs = as.vector(t(pain_wide[i, 2:13]))
+  )
+  
+  tmp2 <- tmp2 %>% drop_na()
+  
+  ggplot(tmp, aes(x = time, y = p)) +
+    geom_line(size = 2, alpha = .5) + 
+    geom_point(data = tmp2, aes(x = time, y = obs), 
+               colour = 'red', size = 5, shape = 18) + 
+    ylim(ylim) +
+    xlab('Time (weeks)') +
+    ylab('KOOS knee pain score') +
+    ggtitle('Predicted vs Observed Pain Progression')
+}
+
+vis_compare(400)
+
+```
+
+
+```{r}
+
+efun <- data.frame(
+  e1 = as.vector(res$eigenfunctions[1, ]),
+  e2 = as.vector(res$eigenfunctions[2, ]),
+  e3 = as.vector(res$eigenfunctions[3, ]),
+  e4 = as.vector(res$eigenfunctions[4, ]),
+  time = res$grid * max(pain_long$time)
+)
+
+efun_ <- gather(efun, key = 'efun', value = 'attr', -time)
+
+ggplot(data = efun_) +
+  geom_line(aes(x = time, y = attr, group = efun, 
+                colour = efun), size = 2, alpha = .6) + 
+  xlab('Time (weeks)') +
+  ylab(" ") +
+  ggtitle("Four identified eigenfunctions (L1 = 50.62, L2 = 5.91, L3 = 2.96, L4 = 1.55)") + 
+  theme(legend.position = "none") +
+  ggsave('Figs/eigenfunctions.png', width = 11, height = 7, dpi = 500)
+
+```
+```{r}
+efun <- res$eigenfunctions
+mean_est <- res$fitted_mean
+grid <- res$grid
+
+write.csv(efun, "Results/eigenfunctions.csv")
+write.csv(mean_est, "Results/fitted_mean.csv")
+write.csv(grid, "Results/grid.csv")
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
